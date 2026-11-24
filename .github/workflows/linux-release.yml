@@ -192,13 +192,16 @@ jobs:
           cat SHA256SUMS
 
       - name: Sign Checksums (if GPG key provided)
-        if: secrets.SIGNING_KEY != ''
         working-directory: dist
         env:
           SIGNING_KEY: ${{ secrets.SIGNING_KEY }}
           SIGNING_KEY_ID: ${{ secrets.SIGNING_KEY_ID }}
           SIGNING_PASSPHRASE: ${{ secrets.SIGNING_PASSPHRASE }}
         run: |
+          if [ -z "$SIGNING_KEY" ]; then
+            echo "No SIGNING_KEY provided; skipping GPG signing."
+            exit 0
+          fi
           echo "$SIGNING_KEY" | gpg --batch --import
           gpg --batch --yes --pinentry-mode loopback \
             --passphrase "$SIGNING_PASSPHRASE" \
