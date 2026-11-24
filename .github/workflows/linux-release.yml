@@ -231,7 +231,7 @@ jobs:
           export DEBIAN_FRONTEND=noninteractive
           apt-get update -qq
           apt-get install -y -qq desktop-file-utils
-          DEB_FILE=$(find dist -name "*.deb" | head -1)
+          DEB_FILE=$(find "$PWD/dist" -name "*.deb" | head -1)
           apt-get install -y "$DEB_FILE"
           test -x "/usr/bin/${{ inputs.app_name }}"
           if [ -f "/usr/share/applications/${{ inputs.app_name }}.desktop" ]; then
@@ -255,7 +255,7 @@ jobs:
           export DEBIAN_FRONTEND=noninteractive
           apt-get update -qq
           apt-get install -y -qq desktop-file-utils
-          DEB_FILE=$(find dist -name "*.deb" | head -1)
+          DEB_FILE=$(find "$PWD/dist" -name "*.deb" | head -1)
           apt-get install -y "$DEB_FILE"
           test -x "/usr/bin/${{ inputs.app_name }}"
           if [ -f "/usr/share/applications/${{ inputs.app_name }}.desktop" ]; then
@@ -277,7 +277,7 @@ jobs:
       - name: Install and verify .rpm
         run: |
           dnf install -y desktop-file-utils
-          RPM_FILE=$(find dist -name "*.rpm" | head -1)
+          RPM_FILE=$(find "$PWD/dist" -name "*.rpm" | head -1)
           dnf install -y "$RPM_FILE"
           test -x "/usr/bin/${{ inputs.app_name }}"
           if [ -f "/usr/share/applications/${{ inputs.app_name }}.desktop" ]; then
@@ -299,7 +299,7 @@ jobs:
       - name: Install and verify .pkg.tar.zst
         run: |
           pacman -Sy --noconfirm desktop-file-utils
-          ARCH_FILE=$(find dist -name "*.pkg.tar.zst" | head -1)
+          ARCH_FILE=$(find "$PWD/dist" -name "*.pkg.tar.zst" | head -1)
           pacman -U --noconfirm "$ARCH_FILE"
           test -x "/usr/bin/${{ inputs.app_name }}"
           if [ -f "/usr/share/applications/${{ inputs.app_name }}.desktop" ]; then
