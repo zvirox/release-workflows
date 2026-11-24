@@ -1,0 +1,365 @@
+name: Linux Uniform Release
+
+on:
+  workflow_call:
+    inputs:
+      app_name:
+        required: true
+        type: string
+        description: "Application and repository name in lowercase kebab-case (e.g. net-watch-pro)"
+      frontend_dir:
+        required: false
+        type: string
+        default: "app"
+        description: "Directory containing frontend package.json"
+      package_manager:
+        required: false
+        type: string
+        default: "npm"
+        description: "npm or pnpm"
+      build_cmd:
+        required: false
+        type: string
+        default: ""
+        description: "Custom build command (if omitted, runs standard frontend build + cargo build)"
+      extra_binaries_cmd:
+        required: false
+        type: string
+        default: ""
+        description: "Command to build helper binaries or artifacts (e.g. atpd-helper, xtask bpf)"
+      binary_path:
+        required: false
+        type: string
+        default: ""
+        description: "Path to built binary (defaults to target/release/<app_name>)"
+      system_deps:
+        required: false
+        type: string
+        default: ""
+        description: "Extra apt build dependencies for ubuntu-22.04"
+      nfpm_config:
+        required: false
+        type: string
+        default: "packaging/nfpm.yaml"
+        description: "Path to nfpm.yaml"
+      node_version:
+        required: false
+        type: string
+        default: "22"
+      rust_version:
+        required: false
+        type: string
+        default: "stable"
+    secrets:
+      SIGNING_KEY:
+        required: false
+      SIGNING_KEY_ID:
+        required: false
+      SIGNING_PASSPHRASE:
+        required: false
+
+permissions:
+  contents: write
+
+jobs:
+  validate-version:
+    name: Validate Release Version
+    runs-on: ubuntu-22.04
+    outputs:
+      version: ${{ steps.version.outputs.version }}
+      is_prerelease: ${{ steps.version.outputs.is_prerelease }}
+    steps:
+      - uses: actions/checkout@v4
+      - name: Parse tag and semver
+        id: version
+        run: |
+          TAG="${GITHUB_REF#refs/tags/}"
+          if [[ ! "$TAG" =~ ^v[0-9] ]]; then
+            echo "❌ Error: Release tag must start with 'v' and semver (e.g. v1.0.0 or v0.1.0-alpha.1)" >&2
+            exit 1
+          fi
+          VERSION="${TAG#v}"
+          echo "version=$VERSION" >> "$GITHUB_OUTPUT"
+          
+          if [[ "$VERSION" =~ (-|\+) ]]; then
+            echo "is_prerelease=true" >> "$GITHUB_OUTPUT"
+          else
+            echo "is_prerelease=false" >> "$GITHUB_OUTPUT"
+          fi
+          echo "Validated tag: $TAG -> Version: $VERSION"
+
+  build-and-package:
+    name: Build & Package (deb, rpm, arch)
+    needs: validate-version
+    runs-on: ubuntu-22.04
+    env:
+      APP_NAME: ${{ inputs.app_name }}
+      VERSION: ${{ needs.validate-version.outputs.version }}
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Install system dependencies
+        run: |
+          sudo apt-get update -qq
+          sudo apt-get install -y --no-install-recommends \
+            build-essential pkg-config libssl-dev libwebkit2gtk-4.1-dev \
+            libgtk-3-dev libayatana-appindicator3-dev librsvg2-dev \
+            desktop-file-utils ${{ inputs.system_deps }}
+
+      - name: Setup Node.js
+        uses: actions/setup-node@v4
+        with:
+          node-version: ${{ inputs.node_version }}
+
+      - name: Setup pnpm (if required)
+        if: inputs.package_manager == 'pnpm'
+        uses: pnpm/action-setup@v4
+        with:
+          version: 10
+
+      - name: Setup Rust toolchain
+        uses: dtolnay/rust-toolchain@stable
+        with:
+          toolchain: ${{ inputs.rust_version }}
+
+      - name: Cache Rust dependencies
+        uses: Swatinem/rust-cache@v2
+
+      - name: Install nfpm
+        run: |
+          NFPM_VERSION="2.41.3"
+          curl -fsSL "https://github.com/goreleaser/nfpm/releases/download/v${NFPM_VERSION}/nfpm_${NFPM_VERSION}_Linux_x86_64.tar.gz" | sudo tar -xz -C /usr/local/bin nfpm
+          nfpm --version
+
+      - name: Build frontend
+        run: |
+          if [ -d "${{ inputs.frontend_dir }}" ]; then
+            cd "${{ inputs.frontend_dir }}"
+            if [ "${{ inputs.package_manager }}" = "pnpm" ]; then
+              pnpm install --frozen-lockfile
+              pnpm build
+            else
+              npm ci
+              npm run build
+            fi
+          fi
+
+      - name: Build extra binaries (if configured)
+        if: inputs.extra_binaries_cmd != ''
+        run: ${{ inputs.extra_binaries_cmd }}
+
+      - name: Build release binaries
+        run: |
+          if [ -n "${{ inputs.build_cmd }}" ]; then
+            ${{ inputs.build_cmd }}
+          else
+            cargo build --release --locked
+          fi
+
+      - name: Assemble Packages with nfpm
+        run: |
+          mkdir -p dist
+          BIN_PATH="${{ inputs.binary_path }}"
+          if [ -z "$BIN_PATH" ]; then
+            BIN_PATH="target/release/${{ inputs.app_name }}"
+          fi
+
+          if [ ! -f "$BIN_PATH" ]; then
+            echo "❌ Error: Release binary not found at $BIN_PATH" >&2
+            ls -la target/release/ || true
+            exit 1
+          fi
+
+          DEB_FILE="dist/${APP_NAME}_${VERSION}_amd64.deb"
+          RPM_FILE="dist/${APP_NAME}-${VERSION}-1.x86_64.rpm"
+          ARCH_FILE="dist/${APP_NAME}-${VERSION}-1-x86_64.pkg.tar.zst"
+
+          echo "Building Debian package: $DEB_FILE"
+          nfpm pkg --config "${{ inputs.nfpm_config }}" --packager deb --target "$DEB_FILE"
+
+          echo "Building RPM package: $RPM_FILE"
+          nfpm pkg --config "${{ inputs.nfpm_config }}" --packager rpm --target "$RPM_FILE"
+
+          echo "Building Arch package: $ARCH_FILE"
+          nfpm pkg --config "${{ inputs.nfpm_config }}" --packager archlinux --target "$ARCH_FILE"
+
+          ls -lh dist/
+
+      - name: Generate Checksums
+        working-directory: dist
+        run: |
+          sha256sum *.deb *.rpm *.pkg.tar.zst > SHA256SUMS
+          cat SHA256SUMS
+
+      - name: Sign Checksums (if GPG key provided)
+        if: secrets.SIGNING_KEY != ''
+        working-directory: dist
+        env:
+          SIGNING_KEY: ${{ secrets.SIGNING_KEY }}
+          SIGNING_KEY_ID: ${{ secrets.SIGNING_KEY_ID }}
+          SIGNING_PASSPHRASE: ${{ secrets.SIGNING_PASSPHRASE }}
+        run: |
+          echo "$SIGNING_KEY" | gpg --batch --import
+          gpg --batch --yes --pinentry-mode loopback \
+            --passphrase "$SIGNING_PASSPHRASE" \
+            --local-user "$SIGNING_KEY_ID" \
+            --detach-sign --armor --output SHA256SUMS.sig SHA256SUMS
+          gpg --verify SHA256SUMS.sig SHA256SUMS
+
+      - name: Upload Release Artifacts
+        uses: actions/upload-artifact@v4
+        with:
+          name: release-packages
+          path: dist/
+          if-no-files-found: error
+
+  smoke-test-deb-ubuntu22:
+    name: Container Test (Ubuntu 22.04)
+    needs: [validate-version, build-and-package]
+    runs-on: ubuntu-latest
+    container: ubuntu:22.04
+    steps:
+      - uses: actions/download-artifact@v4
+        with:
+          name: release-packages
+          path: dist/
+      - name: Install and verify .deb
+        run: |
+          export DEBIAN_FRONTEND=noninteractive
+          apt-get update -qq
+          apt-get install -y -qq desktop-file-utils
+          DEB_FILE=$(find dist -name "*.deb" | head -1)
+          apt-get install -y "$DEB_FILE"
+          test -x "/usr/bin/${{ inputs.app_name }}"
+          if [ -f "/usr/share/applications/${{ inputs.app_name }}.desktop" ]; then
+            desktop-file-validate "/usr/share/applications/${{ inputs.app_name }}.desktop"
+          fi
+          apt-get remove -y "${{ inputs.app_name }}"
+          ! test -e "/usr/bin/${{ inputs.app_name }}"
+
+  smoke-test-deb-ubuntu24:
+    name: Container Test (Ubuntu 24.04)
+    needs: [validate-version, build-and-package]
+    runs-on: ubuntu-latest
+    container: ubuntu:24.04
+    steps:
+      - uses: actions/download-artifact@v4
+        with:
+          name: release-packages
+          path: dist/
+      - name: Install and verify .deb
+        run: |
+          export DEBIAN_FRONTEND=noninteractive
+          apt-get update -qq
+          apt-get install -y -qq desktop-file-utils
+          DEB_FILE=$(find dist -name "*.deb" | head -1)
+          apt-get install -y "$DEB_FILE"
+          test -x "/usr/bin/${{ inputs.app_name }}"
+          if [ -f "/usr/share/applications/${{ inputs.app_name }}.desktop" ]; then
+            desktop-file-validate "/usr/share/applications/${{ inputs.app_name }}.desktop"
+          fi
+          apt-get remove -y "${{ inputs.app_name }}"
+          ! test -e "/usr/bin/${{ inputs.app_name }}"
+
+  smoke-test-rpm-fedora:
+    name: Container Test (Fedora Latest)
+    needs: [validate-version, build-and-package]
+    runs-on: ubuntu-latest
+    container: fedora:latest
+    steps:
+      - uses: actions/download-artifact@v4
+        with:
+          name: release-packages
+          path: dist/
+      - name: Install and verify .rpm
+        run: |
+          dnf install -y desktop-file-utils
+          RPM_FILE=$(find dist -name "*.rpm" | head -1)
+          dnf install -y "$RPM_FILE"
+          test -x "/usr/bin/${{ inputs.app_name }}"
+          if [ -f "/usr/share/applications/${{ inputs.app_name }}.desktop" ]; then
+            desktop-file-validate "/usr/share/applications/${{ inputs.app_name }}.desktop"
+          fi
+          dnf remove -y "${{ inputs.app_name }}"
+          ! test -e "/usr/bin/${{ inputs.app_name }}"
+
+  smoke-test-arch:
+    name: Container Test (Arch Linux Latest)
+    needs: [validate-version, build-and-package]
+    runs-on: ubuntu-latest
+    container: archlinux:latest
+    steps:
+      - uses: actions/download-artifact@v4
+        with:
+          name: release-packages
+          path: dist/
+      - name: Install and verify .pkg.tar.zst
+        run: |
+          pacman -Sy --noconfirm desktop-file-utils
+          ARCH_FILE=$(find dist -name "*.pkg.tar.zst" | head -1)
+          pacman -U --noconfirm "$ARCH_FILE"
+          test -x "/usr/bin/${{ inputs.app_name }}"
+          if [ -f "/usr/share/applications/${{ inputs.app_name }}.desktop" ]; then
+            desktop-file-validate "/usr/share/applications/${{ inputs.app_name }}.desktop"
+          fi
+          pacman -R --noconfirm "${{ inputs.app_name }}"
+          ! test -e "/usr/bin/${{ inputs.app_name }}"
+
+  publish-release:
+    name: Publish Official GitHub Release
+    needs:
+      - validate-version
+      - build-and-package
+      - smoke-test-deb-ubuntu22
+      - smoke-test-deb-ubuntu24
+      - smoke-test-rpm-fedora
+      - smoke-test-arch
+    runs-on: ubuntu-22.04
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/download-artifact@v4
+        with:
+          name: release-packages
+          path: dist/
+      - name: Generate release notes
+        env:
+          APP_NAME: ${{ inputs.app_name }}
+          VERSION: ${{ needs.validate-version.outputs.version }}
+        run: |
+          cat <<EOF > release-notes.md
+          ## Installation
+
+          Download the package matching your distribution from the assets below:
+
+          ### Ubuntu / Debian / Pop!_OS / Linux Mint
+          \`\`\`bash
+          sudo apt install ./${APP_NAME}_${VERSION}_amd64.deb
+          \`\`\`
+
+          ### Fedora / RHEL / openSUSE
+          \`\`\`bash
+          sudo dnf install ./${APP_NAME}-${VERSION}-1.x86_64.rpm
+          \`\`\`
+
+          ### Arch Linux / Manjaro / EndeavourOS
+          \`\`\`bash
+          sudo pacman -U ./${APP_NAME}-${VERSION}-1-x86_64.pkg.tar.zst
+          \`\`\`
+
+          ### Verify Checksums
+          \`\`\`bash
+          sha256sum -c SHA256SUMS
+          \`\`\`
+
+          ---
+          *Notice: AppImage, Flatpak, and AUR builds are deprecated. Releases now exclusively ship official \`.deb\`, \`.rpm\`, and \`.pkg.tar.zst\` native packages.*
+          EOF
+
+      - name: Publish GitHub Release
+        uses: softprops/action-gh-release@v2
+        with:
+          files: dist/*
+          draft: false
+          prerelease: ${{ needs.validate-version.outputs.is_prerelease == 'true' }}
+          body_path: release-notes.md
+          generate_release_notes: true
