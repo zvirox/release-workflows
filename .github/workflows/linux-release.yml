@@ -50,6 +50,11 @@ on:
         required: false
         type: string
         default: "stable"
+      runs_on:
+        required: false
+        type: string
+        default: "ubuntu-22.04"
+        description: "Runner image for build-and-package"
     secrets:
       SIGNING_KEY:
         required: false
@@ -91,7 +96,7 @@ jobs:
   build-and-package:
     name: Build & Package (deb, rpm, arch)
     needs: validate-version
-    runs-on: ubuntu-22.04
+    runs-on: ${{ inputs.runs_on }}
     env:
       APP_NAME: ${{ inputs.app_name }}
       VERSION: ${{ needs.validate-version.outputs.version }}
@@ -148,13 +153,13 @@ jobs:
         if: inputs.extra_binaries_cmd != ''
         run: ${{ inputs.extra_binaries_cmd }}
 
-      - name: Build release binaries
-        run: |
-          if [ -n "${{ inputs.build_cmd }}" ]; then
-            ${{ inputs.build_cmd }}
-          else
-            cargo build --release --locked
-          fi
+      - name: Build release binaries (custom)
+        if: inputs.build_cmd != ''
+        run: ${{ inputs.build_cmd }}
+
+      - name: Build release binaries (default)
+        if: inputs.build_cmd == ''
+        run: cargo build --release --locked
 
       - name: Assemble Packages with nfpm
         run: |
