@@ -55,6 +55,11 @@ on:
         type: string
         default: "ubuntu-22.04"
         description: "Runner image for build-and-package"
+      check_version_flag:
+        required: false
+        type: boolean
+        default: false
+        description: "Whether to run <app_name> --version in container smoke tests"
     secrets:
       SIGNING_KEY:
         required: false
@@ -92,6 +97,58 @@ jobs:
             echo "is_prerelease=false" >> "$GITHUB_OUTPUT"
           fi
           echo "Validated tag: $TAG -> Version: $VERSION"
+
+      - name: Verify manifest versions match release tag
+        env:
+          APP_NAME: ${{ inputs.app_name }}
+          FRONTEND_DIR: ${{ inputs.frontend_dir }}
+          EXPECTED: ${{ steps.version.outputs.version }}
+        run: |
+          python3 - <<'PY'
+          import json, os, pathlib, re
+
+          root = pathlib.Path(".")
+          app_name = os.environ["APP_NAME"]
+          frontend_dir = os.environ["FRONTEND_DIR"]
+          expected = os.environ["EXPECTED"]
+          checked = []
+
+          pkg_json = root / frontend_dir / "package.json"
+          if pkg_json.is_file():
+              v = json.loads(pkg_json.read_text())["version"]
+              assert v == expected, f"{pkg_json}: version {v!r} != tag {expected!r}"
+              checked.append(str(pkg_json))
+
+          for tc in root.rglob("tauri.conf.json"):
+              rel = tc.relative_to(root)
+              if any(p in {"node_modules", "target", "spikes"} for p in rel.parts):
+                  continue
+              v = json.loads(tc.read_text()).get("version")
+              if v:
+                  assert v == expected, f"{rel}: version {v!r} != tag {expected!r}"
+                  checked.append(str(rel))
+
+          root_cargo = root / "Cargo.toml"
+          if root_cargo.is_file():
+              m = re.search(r'^version\s*=\s*"([^"]+)"', root_cargo.read_text(), re.M)
+              if m:
+                  assert m.group(1) == expected, f"Cargo.toml: version {m.group(1)!r} != tag {expected!r}"
+                  checked.append("Cargo.toml")
+
+          for ct in root.rglob("Cargo.toml"):
+              rel = ct.relative_to(root)
+              if any(p in {"node_modules", "target", "spikes"} for p in rel.parts):
+                  continue
+              txt = ct.read_text()
+              if f'name = "{app_name}"' in txt:
+                  m = re.search(r'^version\s*=\s*"([^"]+)"', txt, re.M)
+                  if m:
+                      assert m.group(1) == expected, f"{rel}: version {m.group(1)!r} != tag {expected!r}"
+                      checked.append(str(rel))
+
+          assert checked, "No manifest files were matched for version verification"
+          print(f"Manifest version parity verified ({expected}): {', '.join(checked)}")
+          PY
 
   build-and-package:
     name: Build & Package (deb, rpm, arch)
@@ -163,7 +220,7 @@ jobs:
 
       - name: Assemble Packages with nfpm
         run: |
-          mkdir -p dist
+          rm -rf release-dist && mkdir -p release-dist
           BIN_PATH="${{ inputs.binary_path }}"
           if [ -z "$BIN_PATH" ]; then
             BIN_PATH="target/release/${{ inputs.app_name }}"
@@ -175,9 +232,9 @@ jobs:
             exit 1
           fi
 
-          DEB_FILE="dist/${APP_NAME}_${VERSION}_amd64.deb"
-          RPM_FILE="dist/${APP_NAME}-${VERSION}-1.x86_64.rpm"
-          ARCH_FILE="dist/${APP_NAME}-${VERSION}-1-x86_64.pkg.tar.zst"
+          DEB_FILE="release-dist/${APP_NAME}_${VERSION}_amd64.deb"
+          RPM_FILE="release-dist/${APP_NAME}-${VERSION}-1.x86_64.rpm"
+          ARCH_FILE="release-dist/${APP_NAME}-${VERSION}-1-x86_64.pkg.tar.zst"
 
           echo "Building Debian package: $DEB_FILE"
           nfpm pkg --config "${{ inputs.nfpm_config }}" --packager deb --target "$DEB_FILE"
@@ -188,16 +245,16 @@ jobs:
           echo "Building Arch package: $ARCH_FILE"
           nfpm pkg --config "${{ inputs.nfpm_config }}" --packager archlinux --target "$ARCH_FILE"
 
-          ls -lh dist/
+          ls -lh release-dist/
 
       - name: Generate Checksums
-        working-directory: dist
+        working-directory: release-dist
         run: |
           sha256sum *.deb *.rpm *.pkg.tar.zst > SHA256SUMS
           cat SHA256SUMS
 
       - name: Sign Checksums (if GPG key provided)
-        working-directory: dist
+        working-directory: release-dist
         env:
           SIGNING_KEY: ${{ secrets.SIGNING_KEY }}
           SIGNING_KEY_ID: ${{ secrets.SIGNING_KEY_ID }}
@@ -218,7 +275,7 @@ jobs:
         uses: actions/upload-artifact@v4
         with:
           name: release-packages
-          path: dist/
+          path: release-dist/
           if-no-files-found: error
 
   smoke-test-deb-ubuntu22:
@@ -230,15 +287,18 @@ jobs:
       - uses: actions/download-artifact@v4
         with:
           name: release-packages
-          path: dist/
+          path: release-dist/
       - name: Install and verify .deb
         run: |
           export DEBIAN_FRONTEND=noninteractive
           apt-get update -qq
           apt-get install -y -qq desktop-file-utils
-          DEB_FILE=$(find "$PWD/dist" -name "*.deb" | head -1)
+          DEB_FILE=$(find "$PWD/release-dist" -name "*.deb" | head -1)
           apt-get install -y "$DEB_FILE"
           test -x "/usr/bin/${{ inputs.app_name }}"
+          if [ "${{ inputs.check_version_flag }}" = "true" ]; then
+            "/usr/bin/${{ inputs.app_name }}" --version | grep -F "${{ needs.validate-version.outputs.version }}"
+          fi
           if [ -f "/usr/share/applications/${{ inputs.app_name }}.desktop" ]; then
             desktop-file-validate "/usr/share/applications/${{ inputs.app_name }}.desktop"
           fi
@@ -254,15 +314,18 @@ jobs:
       - uses: actions/download-artifact@v4
         with:
           name: release-packages
-          path: dist/
+          path: release-dist/
       - name: Install and verify .deb
         run: |
           export DEBIAN_FRONTEND=noninteractive
           apt-get update -qq
           apt-get install -y -qq desktop-file-utils
-          DEB_FILE=$(find "$PWD/dist" -name "*.deb" | head -1)
+          DEB_FILE=$(find "$PWD/release-dist" -name "*.deb" | head -1)
           apt-get install -y "$DEB_FILE"
           test -x "/usr/bin/${{ inputs.app_name }}"
+          if [ "${{ inputs.check_version_flag }}" = "true" ]; then
+            "/usr/bin/${{ inputs.app_name }}" --version | grep -F "${{ needs.validate-version.outputs.version }}"
+          fi
           if [ -f "/usr/share/applications/${{ inputs.app_name }}.desktop" ]; then
             desktop-file-validate "/usr/share/applications/${{ inputs.app_name }}.desktop"
           fi
@@ -278,13 +341,16 @@ jobs:
       - uses: actions/download-artifact@v4
         with:
           name: release-packages
-          path: dist/
+          path: release-dist/
       - name: Install and verify .rpm
         run: |
           dnf install -y desktop-file-utils
-          RPM_FILE=$(find "$PWD/dist" -name "*.rpm" | head -1)
+          RPM_FILE=$(find "$PWD/release-dist" -name "*.rpm" | head -1)
           dnf install -y "$RPM_FILE"
           test -x "/usr/bin/${{ inputs.app_name }}"
+          if [ "${{ inputs.check_version_flag }}" = "true" ]; then
+            "/usr/bin/${{ inputs.app_name }}" --version | grep -F "${{ needs.validate-version.outputs.version }}"
+          fi
           if [ -f "/usr/share/applications/${{ inputs.app_name }}.desktop" ]; then
             desktop-file-validate "/usr/share/applications/${{ inputs.app_name }}.desktop"
           fi
@@ -300,13 +366,16 @@ jobs:
       - uses: actions/download-artifact@v4
         with:
           name: release-packages
-          path: dist/
+          path: release-dist/
       - name: Install and verify .pkg.tar.zst
         run: |
           pacman -Sy --noconfirm desktop-file-utils
-          ARCH_FILE=$(find "$PWD/dist" -name "*.pkg.tar.zst" | head -1)
+          ARCH_FILE=$(find "$PWD/release-dist" -name "*.pkg.tar.zst" | head -1)
           pacman -U --noconfirm "$ARCH_FILE"
           test -x "/usr/bin/${{ inputs.app_name }}"
+          if [ "${{ inputs.check_version_flag }}" = "true" ]; then
+            "/usr/bin/${{ inputs.app_name }}" --version | grep -F "${{ needs.validate-version.outputs.version }}"
+          fi
           if [ -f "/usr/share/applications/${{ inputs.app_name }}.desktop" ]; then
             desktop-file-validate "/usr/share/applications/${{ inputs.app_name }}.desktop"
           fi
@@ -328,7 +397,7 @@ jobs:
       - uses: actions/download-artifact@v4
         with:
           name: release-packages
-          path: dist/
+          path: release-dist/
       - name: Generate release notes
         env:
           APP_NAME: ${{ inputs.app_name }}
@@ -366,7 +435,13 @@ jobs:
       - name: Publish GitHub Release
         uses: softprops/action-gh-release@v2
         with:
-          files: dist/*
+          files: |
+            release-dist/*.deb
+            release-dist/*.rpm
+            release-dist/*.pkg.tar.zst
+            release-dist/SHA256SUMS
+            release-dist/SHA256SUMS.sig
+          fail_on_unmatched_files: false
           draft: false
           prerelease: ${{ needs.validate-version.outputs.is_prerelease == 'true' }}
           body_path: release-notes.md

@@ -46,5 +46,19 @@ The packaging plan's **Rule 3** mandates:
 * *Resolution:* Enforce Section 5 of the plan — the git tag is the single source of truth. Synchronize manifests (`package.json`, `Cargo.toml`, `tauri.conf.json`) with the planned release version before tagging.
 
 ### 4. Repository with No Release Workflow
-* **Agentic Tuneup Pro** currently has no `.github/workflows/release.yml`.
-* *Resolution:* ATP will serve as the pilot implementation for the reusable `release-workflows` workflow.
+* **Agentic Tuneup Pro** previously had no `.github/workflows/release.yml`.
+* *Resolution:* ATP implemented `nfpm` packaging and adopted this shared workflow alongside all six repositories.
+
+---
+
+## Locked Release Policy (Final & Enforced)
+
+All six Zvirox Linux desktop repositories (`starship-control`, `screen-studio-pro`, `audio-labs-pro`, `agentic-tuneup-pro`, `easy-edits-pro`, `net-watch-pro`) strictly follow this release manifest:
+
+- **Locked Package Formats:** Every `v*` release produces **only** three native x86_64 packages built by `nfpm` from a single binary build (`packaging/nfpm.yaml`), plus `SHA256SUMS` (and `SHA256SUMS.sig` when `SIGNING_KEY` is provided):
+  1. `<app>_<version>_amd64.deb`
+  2. `<app>-<version>-1.x86_64.rpm`
+  3. `<app>-<version>-1-x86_64.pkg.tar.zst`
+- **Retired Formats:** AppImage, Flatpak, Snap, plain `.tar.gz` archives, and AUR packages/repositories are permanently removed from CI and future planning.
+- **Verification Standard:** Package install, binary presence, desktop validation, and clean removal are verified automatically in clean CI containers (`ubuntu:22.04`, `ubuntu:24.04`, `fedora:latest`, `archlinux:latest`). Separate manual VM release-package tests are removed from planning requirements.
+- **Manifest Version Parity:** CI enforces exact version parity between the git tag (`v<version>`) and `Cargo.toml`, `package.json`, and `tauri.conf.json`.
