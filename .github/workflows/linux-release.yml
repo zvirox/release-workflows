@@ -21,7 +21,7 @@ on:
         required: false
         type: string
         default: ""
-        description: "Custom build command (if omitted, runs standard frontend build + cargo build)"
+        description: "Custom build command (if omitted, runs standard cargo build --release --locked)"
       extra_binaries_cmd:
         required: false
         type: string
@@ -36,7 +36,7 @@ on:
         required: false
         type: string
         default: ""
-        description: "Extra apt build dependencies for ubuntu-22.04"
+        description: "Extra apt build dependencies for the Debian/Ubuntu build"
       nfpm_config:
         required: false
         type: string
@@ -54,12 +54,57 @@ on:
         required: false
         type: string
         default: "ubuntu-22.04"
-        description: "Runner image for build-and-package"
+        description: "Runner image for build-and-package / build-deb"
       check_version_flag:
         required: false
         type: boolean
         default: false
         description: "Whether to run <app_name> --version in container smoke tests"
+      per_distro_build:
+        required: false
+        type: boolean
+        default: false
+        description: "Build native Rust binaries inside each target distro (deb, rpm, arch) for C-ABI/FFmpeg portability"
+      rpm_container:
+        required: false
+        type: string
+        default: "fedora:latest"
+        description: "Container image for per-distro RPM build"
+      arch_container:
+        required: false
+        type: string
+        default: "archlinux:latest"
+        description: "Container image for per-distro Arch build"
+      rpm_build_deps:
+        required: false
+        type: string
+        default: ""
+        description: "Extra dnf build dependencies when per_distro_build is true"
+      arch_build_deps:
+        required: false
+        type: string
+        default: ""
+        description: "Extra pacman build dependencies when per_distro_build is true"
+      smoke_ubuntu22:
+        required: false
+        type: boolean
+        default: true
+        description: "Run container smoke test on ubuntu:22.04"
+      smoke_ubuntu24:
+        required: false
+        type: boolean
+        default: true
+        description: "Run container smoke test on ubuntu:24.04"
+      smoke_fedora:
+        required: false
+        type: boolean
+        default: true
+        description: "Run container smoke test on fedora:latest"
+      smoke_arch:
+        required: false
+        type: boolean
+        default: true
+        description: "Run container smoke test on archlinux:latest"
     secrets:
       SIGNING_KEY:
         required: false
@@ -74,7 +119,7 @@ permissions:
 jobs:
   validate-version:
     name: Validate Release Version
-    runs-on: ubuntu-22.04
+    runs-on: ubuntu-24.04
     outputs:
       version: ${{ steps.version.outputs.version }}
       is_prerelease: ${{ steps.version.outputs.is_prerelease }}
@@ -90,7 +135,7 @@ jobs:
           fi
           VERSION="${TAG#v}"
           echo "version=$VERSION" >> "$GITHUB_OUTPUT"
-          
+
           if [[ "$VERSION" =~ (-|\+) ]]; then
             echo "is_prerelease=true" >> "$GITHUB_OUTPUT"
           else
@@ -150,9 +195,13 @@ jobs:
           print(f"Manifest version parity verified ({expected}): {', '.join(checked)}")
           PY
 
+  # ---------------------------------------------------------------------------
+  # Mode A (default): single binary build packaged into deb, rpm, archlinux
+  # ---------------------------------------------------------------------------
   build-and-package:
     name: Build & Package (deb, rpm, arch)
     needs: validate-version
+    if: ${{ !inputs.per_distro_build }}
     runs-on: ${{ inputs.runs_on }}
     env:
       APP_NAME: ${{ inputs.app_name }}
@@ -278,9 +327,324 @@ jobs:
           path: release-dist/
           if-no-files-found: error
 
+  # ---------------------------------------------------------------------------
+  # Mode B (per_distro_build: true): native Rust builds per distro + nfpm
+  # ---------------------------------------------------------------------------
+  build-frontend:
+    name: Build Frontend Assets
+    needs: validate-version
+    if: ${{ inputs.per_distro_build }}
+    runs-on: ubuntu-24.04
+    outputs:
+      has_dist: ${{ steps.frontend.outputs.has_dist }}
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-node@v4
+        with:
+          node-version: ${{ inputs.node_version }}
+
+      - name: Setup pnpm (if required)
+        if: inputs.package_manager == 'pnpm'
+        uses: pnpm/action-setup@v4
+        with:
+          version: 10
+
+      - name: Build frontend
+        id: frontend
+        run: |
+          if [ -d "${{ inputs.frontend_dir }}" ] && [ -f "${{ inputs.frontend_dir }}/package.json" ]; then
+            cd "${{ inputs.frontend_dir }}"
+            if [ "${{ inputs.package_manager }}" = "pnpm" ]; then
+              pnpm install --frozen-lockfile
+              pnpm build
+            else
+              npm ci
+              npm run build
+            fi
+            echo "has_dist=true" >> "$GITHUB_OUTPUT"
+          else
+            echo "has_dist=false" >> "$GITHUB_OUTPUT"
+          fi
+
+      - name: Upload frontend dist
+        if: steps.frontend.outputs.has_dist == 'true'
+        uses: actions/upload-artifact@v4
+        with:
+          name: frontend-dist
+          path: ${{ inputs.frontend_dir }}/dist
+          if-no-files-found: error
+
+  build-deb:
+    name: Build & Package (deb)
+    needs: [validate-version, build-frontend]
+    if: ${{ inputs.per_distro_build }}
+    runs-on: ${{ inputs.runs_on }}
+    env:
+      APP_NAME: ${{ inputs.app_name }}
+      VERSION: ${{ needs.validate-version.outputs.version }}
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Download frontend dist
+        if: needs.build-frontend.outputs.has_dist == 'true'
+        uses: actions/download-artifact@v4
+        with:
+          name: frontend-dist
+          path: ${{ inputs.frontend_dir }}/dist
+
+      - name: Install system dependencies
+        run: |
+          sudo apt-get update -qq
+          sudo apt-get install -y --no-install-recommends \
+            build-essential pkg-config libssl-dev libwebkit2gtk-4.1-dev \
+            libgtk-3-dev libayatana-appindicator3-dev librsvg2-dev \
+            desktop-file-utils ${{ inputs.system_deps }}
+
+      - name: Setup Rust toolchain
+        uses: dtolnay/rust-toolchain@stable
+        with:
+          toolchain: ${{ inputs.rust_version }}
+
+      - name: Cache Rust dependencies
+        uses: Swatinem/rust-cache@v2
+        with:
+          shared-key: deb-${{ inputs.runs_on }}
+
+      - name: Install nfpm
+        run: |
+          NFPM_VERSION="2.41.3"
+          curl -fsSL "https://github.com/goreleaser/nfpm/releases/download/v${NFPM_VERSION}/nfpm_${NFPM_VERSION}_Linux_x86_64.tar.gz" | sudo tar -xz -C /usr/local/bin nfpm
+          nfpm --version
+
+      - name: Build extra binaries (if configured)
+        if: inputs.extra_binaries_cmd != ''
+        run: ${{ inputs.extra_binaries_cmd }}
+
+      - name: Build release binaries (custom)
+        if: inputs.build_cmd != ''
+        run: ${{ inputs.build_cmd }}
+
+      - name: Build release binaries (default)
+        if: inputs.build_cmd == ''
+        run: cargo build --release --locked
+
+      - name: Package deb with nfpm
+        run: |
+          rm -rf release-dist && mkdir -p release-dist
+          BIN_PATH="${{ inputs.binary_path }}"
+          if [ -z "$BIN_PATH" ]; then
+            BIN_PATH="target/release/${{ inputs.app_name }}"
+          fi
+          test -f "$BIN_PATH"
+          DEB_FILE="release-dist/${APP_NAME}_${VERSION}_amd64.deb"
+          nfpm pkg --config "${{ inputs.nfpm_config }}" --packager deb --target "$DEB_FILE"
+          ls -lh release-dist/
+
+      - name: Upload deb artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: pkg-deb
+          path: release-dist/*.deb
+          if-no-files-found: error
+
+  build-rpm:
+    name: Build & Package (rpm)
+    needs: [validate-version, build-frontend]
+    if: ${{ inputs.per_distro_build }}
+    runs-on: ubuntu-latest
+    container: ${{ inputs.rpm_container }}
+    env:
+      APP_NAME: ${{ inputs.app_name }}
+      VERSION: ${{ needs.validate-version.outputs.version }}
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Download frontend dist
+        if: needs.build-frontend.outputs.has_dist == 'true'
+        uses: actions/download-artifact@v4
+        with:
+          name: frontend-dist
+          path: ${{ inputs.frontend_dir }}/dist
+
+      - name: Install Fedora system dependencies
+        run: |
+          dnf install -y --setopt=install_weak_deps=False \
+            gcc gcc-c++ make pkgconf-pkg-config openssl-devel \
+            webkit2gtk4.1-devel gtk3-devel libayatana-appindicator-gtk3-devel \
+            librsvg2-devel desktop-file-utils git curl tar gzip findutils ca-certificates \
+            ${{ inputs.rpm_build_deps }}
+
+      - name: Setup Rust toolchain
+        run: |
+          curl --proto '=https' --tlsv1.2 -sSf https://sh.rustup.rs | sh -s -- -y --profile minimal --default-toolchain "${{ inputs.rust_version }}"
+          echo "$HOME/.cargo/bin" >> "$GITHUB_PATH"
+          "$HOME/.cargo/bin/rustc" --version
+
+      - name: Cache Rust dependencies
+        uses: Swatinem/rust-cache@v2
+        with:
+          shared-key: rpm-${{ inputs.rpm_container }}
+
+      - name: Install nfpm
+        run: |
+          NFPM_VERSION="2.41.3"
+          curl -fsSL "https://github.com/goreleaser/nfpm/releases/download/v${NFPM_VERSION}/nfpm_${NFPM_VERSION}_Linux_x86_64.tar.gz" | tar -xz -C /usr/local/bin nfpm
+          nfpm --version
+
+      - name: Build extra binaries (if configured)
+        if: inputs.extra_binaries_cmd != ''
+        run: ${{ inputs.extra_binaries_cmd }}
+
+      - name: Build release binaries (custom)
+        if: inputs.build_cmd != ''
+        run: ${{ inputs.build_cmd }}
+
+      - name: Build release binaries (default)
+        if: inputs.build_cmd == ''
+        run: cargo build --release --locked
+
+      - name: Package rpm with nfpm
+        run: |
+          rm -rf release-dist && mkdir -p release-dist
+          BIN_PATH="${{ inputs.binary_path }}"
+          if [ -z "$BIN_PATH" ]; then
+            BIN_PATH="target/release/${{ inputs.app_name }}"
+          fi
+          test -f "$BIN_PATH"
+          RPM_FILE="release-dist/${APP_NAME}-${VERSION}-1.x86_64.rpm"
+          nfpm pkg --config "${{ inputs.nfpm_config }}" --packager rpm --target "$RPM_FILE"
+          ls -lh release-dist/
+
+      - name: Upload rpm artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: pkg-rpm
+          path: release-dist/*.rpm
+          if-no-files-found: error
+
+  build-arch:
+    name: Build & Package (arch)
+    needs: [validate-version, build-frontend]
+    if: ${{ inputs.per_distro_build }}
+    runs-on: ubuntu-latest
+    container: ${{ inputs.arch_container }}
+    env:
+      APP_NAME: ${{ inputs.app_name }}
+      VERSION: ${{ needs.validate-version.outputs.version }}
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Download frontend dist
+        if: needs.build-frontend.outputs.has_dist == 'true'
+        uses: actions/download-artifact@v4
+        with:
+          name: frontend-dist
+          path: ${{ inputs.frontend_dir }}/dist
+
+      - name: Install Arch system dependencies
+        run: |
+          pacman -Syu --noconfirm --needed \
+            base-devel pkgconf openssl webkit2gtk-4.1 gtk3 \
+            libayatana-appindicator librsvg desktop-file-utils \
+            git curl tar gzip ca-certificates rustup ${{ inputs.arch_build_deps }}
+          rustup default "${{ inputs.rust_version }}"
+          rustc --version
+
+      - name: Cache Rust dependencies
+        uses: Swatinem/rust-cache@v2
+        with:
+          shared-key: arch-${{ inputs.arch_container }}
+
+      - name: Install nfpm
+        run: |
+          NFPM_VERSION="2.41.3"
+          curl -fsSL "https://github.com/goreleaser/nfpm/releases/download/v${NFPM_VERSION}/nfpm_${NFPM_VERSION}_Linux_x86_64.tar.gz" | tar -xz -C /usr/local/bin nfpm
+          nfpm --version
+
+      - name: Build extra binaries (if configured)
+        if: inputs.extra_binaries_cmd != ''
+        run: ${{ inputs.extra_binaries_cmd }}
+
+      - name: Build release binaries (custom)
+        if: inputs.build_cmd != ''
+        run: ${{ inputs.build_cmd }}
+
+      - name: Build release binaries (default)
+        if: inputs.build_cmd == ''
+        run: cargo build --release --locked
+
+      - name: Package Arch pkg.tar.zst with nfpm
+        run: |
+          rm -rf release-dist && mkdir -p release-dist
+          BIN_PATH="${{ inputs.binary_path }}"
+          if [ -z "$BIN_PATH" ]; then
+            BIN_PATH="target/release/${{ inputs.app_name }}"
+          fi
+          test -f "$BIN_PATH"
+          ARCH_FILE="release-dist/${APP_NAME}-${VERSION}-1-x86_64.pkg.tar.zst"
+          nfpm pkg --config "${{ inputs.nfpm_config }}" --packager archlinux --target "$ARCH_FILE"
+          ls -lh release-dist/
+
+      - name: Upload arch artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: pkg-arch
+          path: release-dist/*.pkg.tar.zst
+          if-no-files-found: error
+
+  package-bundle:
+    name: Bundle Checksums & Signatures
+    needs: [validate-version, build-deb, build-rpm, build-arch]
+    if: ${{ inputs.per_distro_build }}
+    runs-on: ubuntu-24.04
+    steps:
+      - name: Download per-distro packages
+        uses: actions/download-artifact@v4
+        with:
+          pattern: pkg-*
+          path: release-dist/
+          merge-multiple: true
+
+      - name: Generate Checksums
+        working-directory: release-dist
+        run: |
+          ls -lh
+          sha256sum *.deb *.rpm *.pkg.tar.zst > SHA256SUMS
+          cat SHA256SUMS
+
+      - name: Sign Checksums (if GPG key provided)
+        working-directory: release-dist
+        env:
+          SIGNING_KEY: ${{ secrets.SIGNING_KEY }}
+          SIGNING_KEY_ID: ${{ secrets.SIGNING_KEY_ID }}
+          SIGNING_PASSPHRASE: ${{ secrets.SIGNING_PASSPHRASE }}
+        run: |
+          if [ -z "$SIGNING_KEY" ]; then
+            echo "No SIGNING_KEY provided; skipping GPG signing."
+            exit 0
+          fi
+          echo "$SIGNING_KEY" | gpg --batch --import
+          gpg --batch --yes --pinentry-mode loopback \
+            --passphrase "$SIGNING_PASSPHRASE" \
+            --local-user "$SIGNING_KEY_ID" \
+            --detach-sign --armor --output SHA256SUMS.sig SHA256SUMS
+          gpg --verify SHA256SUMS.sig SHA256SUMS
+
+      - name: Upload Release Artifacts
+        uses: actions/upload-artifact@v4
+        with:
+          name: release-packages
+          path: release-dist/
+          if-no-files-found: error
+
+  # ---------------------------------------------------------------------------
+  # Clean-container verification (install + ldd link check + --version + remove)
+  # ---------------------------------------------------------------------------
   smoke-test-deb-ubuntu22:
     name: Container Test (Ubuntu 22.04)
-    needs: [validate-version, build-and-package]
+    needs: [validate-version, build-and-package, package-bundle]
+    if: ${{ always() && inputs.smoke_ubuntu22 && needs.validate-version.result == 'success' && ((inputs.per_distro_build && needs.package-bundle.result == 'success') || (!inputs.per_distro_build && needs.build-and-package.result == 'success')) }}
     runs-on: ubuntu-latest
     container: ubuntu:22.04
     steps:
@@ -296,6 +660,17 @@ jobs:
           DEB_FILE=$(find "$PWD/release-dist" -name "*.deb" | head -1)
           apt-get install -y "$DEB_FILE"
           test -x "/usr/bin/${{ inputs.app_name }}"
+          while IFS= read -r bin; do
+            [ -f "$bin" ] && [ -x "$bin" ] || continue
+            if [ "$(head -c4 "$bin" | od -An -tx1 | tr -d ' \n')" = "7f454c46" ]; then
+              echo "Checking shared libraries for $bin..."
+              LDD_OUT=$(ldd "$bin")
+              if echo "$LDD_OUT" | grep -q "not found"; then
+                echo "$LDD_OUT" >&2
+                exit 1
+              fi
+            fi
+          done < <(dpkg -L "${{ inputs.app_name }}" | grep '^/usr/bin/' || true)
           if [ "${{ inputs.check_version_flag }}" = "true" ]; then
             "/usr/bin/${{ inputs.app_name }}" --version | grep -F "${{ needs.validate-version.outputs.version }}"
           fi
@@ -307,7 +682,8 @@ jobs:
 
   smoke-test-deb-ubuntu24:
     name: Container Test (Ubuntu 24.04)
-    needs: [validate-version, build-and-package]
+    needs: [validate-version, build-and-package, package-bundle]
+    if: ${{ always() && inputs.smoke_ubuntu24 && needs.validate-version.result == 'success' && ((inputs.per_distro_build && needs.package-bundle.result == 'success') || (!inputs.per_distro_build && needs.build-and-package.result == 'success')) }}
     runs-on: ubuntu-latest
     container: ubuntu:24.04
     steps:
@@ -323,6 +699,17 @@ jobs:
           DEB_FILE=$(find "$PWD/release-dist" -name "*.deb" | head -1)
           apt-get install -y "$DEB_FILE"
           test -x "/usr/bin/${{ inputs.app_name }}"
+          while IFS= read -r bin; do
+            [ -f "$bin" ] && [ -x "$bin" ] || continue
+            if [ "$(head -c4 "$bin" | od -An -tx1 | tr -d ' \n')" = "7f454c46" ]; then
+              echo "Checking shared libraries for $bin..."
+              LDD_OUT=$(ldd "$bin")
+              if echo "$LDD_OUT" | grep -q "not found"; then
+                echo "$LDD_OUT" >&2
+                exit 1
+              fi
+            fi
+          done < <(dpkg -L "${{ inputs.app_name }}" | grep '^/usr/bin/' || true)
           if [ "${{ inputs.check_version_flag }}" = "true" ]; then
             "/usr/bin/${{ inputs.app_name }}" --version | grep -F "${{ needs.validate-version.outputs.version }}"
           fi
@@ -334,9 +721,10 @@ jobs:
 
   smoke-test-rpm-fedora:
     name: Container Test (Fedora Latest)
-    needs: [validate-version, build-and-package]
+    needs: [validate-version, build-and-package, package-bundle]
+    if: ${{ always() && inputs.smoke_fedora && needs.validate-version.result == 'success' && ((inputs.per_distro_build && needs.package-bundle.result == 'success') || (!inputs.per_distro_build && needs.build-and-package.result == 'success')) }}
     runs-on: ubuntu-latest
-    container: fedora:latest
+    container: ${{ inputs.rpm_container }}
     steps:
       - uses: actions/download-artifact@v4
         with:
@@ -348,6 +736,17 @@ jobs:
           RPM_FILE=$(find "$PWD/release-dist" -name "*.rpm" | head -1)
           dnf install -y "$RPM_FILE"
           test -x "/usr/bin/${{ inputs.app_name }}"
+          while IFS= read -r bin; do
+            [ -f "$bin" ] && [ -x "$bin" ] || continue
+            if [ "$(head -c4 "$bin" | od -An -tx1 | tr -d ' \n')" = "7f454c46" ]; then
+              echo "Checking shared libraries for $bin..."
+              LDD_OUT=$(ldd "$bin")
+              if echo "$LDD_OUT" | grep -q "not found"; then
+                echo "$LDD_OUT" >&2
+                exit 1
+              fi
+            fi
+          done < <(rpm -ql "${{ inputs.app_name }}" | grep '^/usr/bin/' || true)
           if [ "${{ inputs.check_version_flag }}" = "true" ]; then
             "/usr/bin/${{ inputs.app_name }}" --version | grep -F "${{ needs.validate-version.outputs.version }}"
           fi
@@ -359,9 +758,10 @@ jobs:
 
   smoke-test-arch:
     name: Container Test (Arch Linux Latest)
-    needs: [validate-version, build-and-package]
+    needs: [validate-version, build-and-package, package-bundle]
+    if: ${{ always() && inputs.smoke_arch && needs.validate-version.result == 'success' && ((inputs.per_distro_build && needs.package-bundle.result == 'success') || (!inputs.per_distro_build && needs.build-and-package.result == 'success')) }}
     runs-on: ubuntu-latest
-    container: archlinux:latest
+    container: ${{ inputs.arch_container }}
     steps:
       - uses: actions/download-artifact@v4
         with:
@@ -373,6 +773,17 @@ jobs:
           ARCH_FILE=$(find "$PWD/release-dist" -name "*.pkg.tar.zst" | head -1)
           pacman -U --noconfirm "$ARCH_FILE"
           test -x "/usr/bin/${{ inputs.app_name }}"
+          while IFS= read -r bin; do
+            [ -f "$bin" ] && [ -x "$bin" ] || continue
+            if [ "$(head -c4 "$bin" | od -An -tx1 | tr -d ' \n')" = "7f454c46" ]; then
+              echo "Checking shared libraries for $bin..."
+              LDD_OUT=$(ldd "$bin")
+              if echo "$LDD_OUT" | grep -q "not found"; then
+                echo "$LDD_OUT" >&2
+                exit 1
+              fi
+            fi
+          done < <(pacman -Qlq "${{ inputs.app_name }}" | grep '^/usr/bin/' || true)
           if [ "${{ inputs.check_version_flag }}" = "true" ]; then
             "/usr/bin/${{ inputs.app_name }}" --version | grep -F "${{ needs.validate-version.outputs.version }}"
           fi
@@ -387,11 +798,22 @@ jobs:
     needs:
       - validate-version
       - build-and-package
+      - package-bundle
       - smoke-test-deb-ubuntu22
       - smoke-test-deb-ubuntu24
       - smoke-test-rpm-fedora
       - smoke-test-arch
-    runs-on: ubuntu-22.04
+    if: >-
+      ${{
+        always() &&
+        needs.validate-version.result == 'success' &&
+        ((inputs.per_distro_build && needs.package-bundle.result == 'success') || (!inputs.per_distro_build && needs.build-and-package.result == 'success')) &&
+        ((inputs.smoke_ubuntu22 && needs.smoke-test-deb-ubuntu22.result == 'success') || (!inputs.smoke_ubuntu22 && needs.smoke-test-deb-ubuntu22.result == 'skipped')) &&
+        ((inputs.smoke_ubuntu24 && needs.smoke-test-deb-ubuntu24.result == 'success') || (!inputs.smoke_ubuntu24 && needs.smoke-test-deb-ubuntu24.result == 'skipped')) &&
+        ((inputs.smoke_fedora && needs.smoke-test-rpm-fedora.result == 'success') || (!inputs.smoke_fedora && needs.smoke-test-rpm-fedora.result == 'skipped')) &&
+        ((inputs.smoke_arch && needs.smoke-test-arch.result == 'success') || (!inputs.smoke_arch && needs.smoke-test-arch.result == 'skipped'))
+      }}
+    runs-on: ubuntu-24.04
     steps:
       - uses: actions/checkout@v4
       - uses: actions/download-artifact@v4

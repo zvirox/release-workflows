@@ -9,12 +9,12 @@ sudo apt install ./__APP___${VERSION}_amd64.deb
 
 ### Fedora / RHEL / openSUSE
 ```bash
-sudo dnf install ./__APP___${VERSION}-1.x86_64.rpm
+sudo dnf install ./__APP__-${VERSION}-1.x86_64.rpm
 ```
 
 ### Arch Linux / Manjaro / EndeavourOS
 ```bash
-sudo pacman -U ./__APP___${VERSION}-1-x86_64.pkg.tar.zst
+sudo pacman -U ./__APP__-${VERSION}-1-x86_64.pkg.tar.zst
 ```
 
 ### Verify Checksums
