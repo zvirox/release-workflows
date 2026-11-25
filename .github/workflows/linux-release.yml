@@ -660,7 +660,7 @@ jobs:
           DEB_FILE=$(find "$PWD/release-dist" -name "*.deb" | head -1)
           apt-get install -y "$DEB_FILE"
           test -x "/usr/bin/${{ inputs.app_name }}"
-          while IFS= read -r bin; do
+          for bin in $(dpkg -L "${{ inputs.app_name }}" | grep '^/usr/bin/' || true); do
             [ -f "$bin" ] && [ -x "$bin" ] || continue
             if [ "$(head -c4 "$bin" | od -An -tx1 | tr -d ' \n')" = "7f454c46" ]; then
               echo "Checking shared libraries for $bin..."
@@ -670,7 +670,7 @@ jobs:
                 exit 1
               fi
             fi
-          done < <(dpkg -L "${{ inputs.app_name }}" | grep '^/usr/bin/' || true)
+          done
           if [ "${{ inputs.check_version_flag }}" = "true" ]; then
             "/usr/bin/${{ inputs.app_name }}" --version | grep -F "${{ needs.validate-version.outputs.version }}"
           fi
@@ -699,7 +699,7 @@ jobs:
           DEB_FILE=$(find "$PWD/release-dist" -name "*.deb" | head -1)
           apt-get install -y "$DEB_FILE"
           test -x "/usr/bin/${{ inputs.app_name }}"
-          while IFS= read -r bin; do
+          for bin in $(dpkg -L "${{ inputs.app_name }}" | grep '^/usr/bin/' || true); do
             [ -f "$bin" ] && [ -x "$bin" ] || continue
             if [ "$(head -c4 "$bin" | od -An -tx1 | tr -d ' \n')" = "7f454c46" ]; then
               echo "Checking shared libraries for $bin..."
@@ -709,7 +709,7 @@ jobs:
                 exit 1
               fi
             fi
-          done < <(dpkg -L "${{ inputs.app_name }}" | grep '^/usr/bin/' || true)
+          done
           if [ "${{ inputs.check_version_flag }}" = "true" ]; then
             "/usr/bin/${{ inputs.app_name }}" --version | grep -F "${{ needs.validate-version.outputs.version }}"
           fi
@@ -736,7 +736,7 @@ jobs:
           RPM_FILE=$(find "$PWD/release-dist" -name "*.rpm" | head -1)
           dnf install -y "$RPM_FILE"
           test -x "/usr/bin/${{ inputs.app_name }}"
-          while IFS= read -r bin; do
+          for bin in $(rpm -ql "${{ inputs.app_name }}" | grep '^/usr/bin/' || true); do
             [ -f "$bin" ] && [ -x "$bin" ] || continue
             if [ "$(head -c4 "$bin" | od -An -tx1 | tr -d ' \n')" = "7f454c46" ]; then
               echo "Checking shared libraries for $bin..."
@@ -746,7 +746,7 @@ jobs:
                 exit 1
               fi
             fi
-          done < <(rpm -ql "${{ inputs.app_name }}" | grep '^/usr/bin/' || true)
+          done
           if [ "${{ inputs.check_version_flag }}" = "true" ]; then
             "/usr/bin/${{ inputs.app_name }}" --version | grep -F "${{ needs.validate-version.outputs.version }}"
           fi
@@ -773,7 +773,7 @@ jobs:
           ARCH_FILE=$(find "$PWD/release-dist" -name "*.pkg.tar.zst" | head -1)
           pacman -U --noconfirm "$ARCH_FILE"
           test -x "/usr/bin/${{ inputs.app_name }}"
-          while IFS= read -r bin; do
+          for bin in $(pacman -Qlq "${{ inputs.app_name }}" | grep '^/usr/bin/' || true); do
             [ -f "$bin" ] && [ -x "$bin" ] || continue
             if [ "$(head -c4 "$bin" | od -An -tx1 | tr -d ' \n')" = "7f454c46" ]; then
               echo "Checking shared libraries for $bin..."
@@ -783,7 +783,7 @@ jobs:
                 exit 1
               fi
             fi
-          done < <(pacman -Qlq "${{ inputs.app_name }}" | grep '^/usr/bin/' || true)
+          done
           if [ "${{ inputs.check_version_flag }}" = "true" ]; then
             "/usr/bin/${{ inputs.app_name }}" --version | grep -F "${{ needs.validate-version.outputs.version }}"
           fi
